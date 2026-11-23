@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Launch Radar - pre-token protocols, priced and ranked</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <div class="mark">LR</div>
+    <div>
+      <h1>Launch Radar</h1>
+      <p class="tag">Every pre-token protocol in the snapshot, priced by a model fitted on the ones that already trade - and ranked.</p>
+    </div>
+  </div>
+  <div class="asof" id="asof"></div>
+</header>
+
+<section class="strip" id="strip" aria-label="Coverage and model integrity"></section>
+
+<nav class="controls" aria-label="Board controls">
+  <input id="q" type="search" placeholder="Search protocols..." aria-label="Search protocols">
+  <select id="fam" aria-label="Filter by family"></select>
+  <select id="chain" aria-label="Filter by chain"></select>
+  <label class="chk"><input id="wl" type="checkbox"> Watchlist only</label>
+  <span class="count" id="count"></span>
+</nav>
+
+<main>
+  <table id="board" aria-label="Ranked pre-token protocols">
+    <thead>
+      <tr>
+        <th data-k="rank" class="num sortable">#</th>
+        <th data-k="name" class="sortable">Protocol</th>
+        <th data-k="family" class="sortable">Family</th>
+        <th>Chains</th>
+        <th data-k="tvl_usd" class="num sortable">TVL</th>
+        <th data-k="change_7d" class="num sortable">7d</th>
+        <th data-k="age_days" class="num sortable">Age</th>
+        <th data-k="implied_value_usd" class="num sortable">Implied value</th>
+        <th data-k="launch_odds" class="num sortable">Launch odds</th>
+        <th data-k="expected_value_usd" class="num sortable">Expected value</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <section id="detail" class="detail" hidden></section>
+
+  <section class="panel" id="live-panel">
+    <h2>Already trading - the comparison set, never ranked</h2>
+    <p class="note">These protocols' tokens trade today. The board does not rank them; it learns from them. Their market caps against their TVL are the observations the value model is fitted on (exchange tokens set aside).</p>
+    <table id="live" aria-label="Live token protocols">
+      <thead><tr><th>Protocol</th><th>Family</th><th class="num">TVL</th><th class="num">Market cap</th><th class="num">Actual multiple</th><th class="num">7d</th></tr></thead>
+      <tbody id="live-rows"></tbody>
+    </table>
+  </section>
+
+  <section class="panel" id="model-panel">
+    <h2>The model, stated plainly</h2>
+    <div id="model-text"></div>
+    <h3>Held-out record - the model pricing protocols it was not fitted on</h3>
+    <table id="valid" aria-label="Held-out validation">
+      <thead><tr><th>Split</th><th class="num">Fitted on</th><th class="num">Priced</th><th class="num">Median error</th><th class="num">Priced within x2</th></tr></thead>
+      <tbody id="valid-rows"></tbody>
+    </table>
+    <h3>Family adjustments - each family's fitted lift or discount against the size line</h3>
+    <table id="fam-adj" aria-label="Family adjustments">
+      <thead><tr><th>Family</th><th class="num">Comps</th><th class="num">Adjustment</th></tr></thead>
+      <tbody id="fam-rows"></tbody>
+    </table>
+    <h3>Every protocol accounted for</h3>
+    <table id="acct" aria-label="Accounting">
+      <tbody id="acct-rows"></tbody>
+    </table>
+  </section>
+</main>
+
+<footer>
+  <p id="foot"></p>
+</footer>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
