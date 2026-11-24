@@ -37,6 +37,16 @@
 // A row's expected value is its implied value times its launch odds. The board is ranked by
 // implied value, as the bounty asks; the dashboard can re-sort by expected value, TVL, growth,
 // age or odds, because different readers hunt differently.
+//
+// The evidence layer (buildEvidence, below) tests every claim the page makes, on the same
+// snapshot, with the model's own fitting code: each value term's held-out error with and
+// without it under a walk-forward split (fit on the protocols listed earlier, price the ones
+// listed later) and under leave-one-out (each comp priced by a fit on the others); two
+// candidate terms the model does not carry, tested the same way and left out; the launch
+// odds' Brier score against the base rate on a blind split; and the printed value range's
+// stated coverage against its measured coverage in both tests. Nothing in it is asserted:
+// every figure is computed from the snapshot the program was handed, so the same page on a
+// different snapshot carries that snapshot's evidence, not this one's.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -72,7 +82,7 @@ export class SnapshotError extends Error {
 const DAY_MS = 86_400_000;
 
 /** The model's version label: the dashboard names it and the board carries it. */
-export const MODEL_VERSION = 'comps-2';
+export const MODEL_VERSION = 'comps-3';
 
 /** How many live-token protocols the dashboard's Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -154,6 +164,12 @@ const VERSIONED = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
  */
 const PRODUCT_CATEGORIES = new Set(['Bridge', 'Canonical Bridge', 'Liquid Restaking', 'Restaked BTC']);
 
+/** The snapshot's own bridge categories, named in the accounting from its category field. */
+const BRIDGE_CATEGORIES = new Set(['Bridge', 'Canonical Bridge']);
+
+/** The snapshot's own liquid-restaking categories, named in the accounting the same way. */
+const RESTAKING_CATEGORIES = new Set(['Liquid Restaking', 'Restaked BTC']);
+
 /** A name carrying a whole word wrapped, staked or staking is a product of a traded token. */
 const PRODUCT_NAME = /\b(wrapped|staked|staking)\b/i;
 
@@ -225,8 +241,15 @@ export function fittedLogValue(fit: Fit, p: SnapshotProtocol, asOf: string): { l
  * Fit the model on a set of comps: least squares for the size term, then each later term fitted
  * on the residuals the earlier terms leave. Deterministic: no sampling anywhere, the split that
  * calls this twice is by slug hash.
+ *
+ * The fit is staged so the evidence layer can price with a prefix of it: stage 0 is flat (every
+ * comp priced at the comps' median), 1 the size term alone, 2 with the family adjustment, 3
+ * with growth, 4 the full model. A later term is fitted on the residuals the earlier terms
+ * leave, so zeroing the terms past a stage is exactly the model stopped at that stage - one
+ * code path, and stage 4 is the board's fit, unchanged.
  */
-export function fitModel(comps: SnapshotProtocol[], asOf: string): Fit {
+function fitStaged(comps: SnapshotProtocol[], asOf: string, stage: number): Fit {
+  if (comps.length === 0) return { intercept: 0, slope: 0, family_adj: {}, growth_coef: 0, age_coef: 0, comps: 0 };
   const xs = comps.map((p) => Math.log(p.tvl_usd));
   const ys = comps.map((p) => Math.log(p.mcap_usd as number));
   const n = comps.length;
@@ -303,7 +326,22 @@ export function fitModel(comps: SnapshotProtocol[], asOf: string): Fit {
     denA += (v - mvA) * (v - mvA);
   });
   const age_coef = denA > 0 ? numA / denA : 0;
-  return { intercept, slope, family_adj, growth_coef, age_coef, comps: n };
+  const full: Fit = { intercept, slope, family_adj, growth_coef, age_coef, comps: n };
+  if (stage >= 4) return full;
+  const flat = [...ys].sort((a, b) => a - b)[Math.floor(ys.length / 2)] ?? 0;
+  return {
+    intercept: stage >= 1 ? intercept : flat,
+    slope: stage >= 1 ? slope : 0,
+    family_adj: stage >= 2 ? family_adj : Object.fromEntries(FAMILIES.map((f) => [f, 0])),
+    growth_coef: stage >= 3 ? growth_coef : 0,
+    age_coef: 0,
+    comps: n,
+  };
+}
+
+/** The board's fit: the full four-term model, stage 4 of fitStaged. */
+export function fitModel(comps: SnapshotProtocol[], asOf: string): Fit {
+  return fitStaged(comps, asOf, 4);
 }
 
 /** A deterministic split of the comps in two, by the parity of the slug's character sum. */
@@ -347,6 +385,454 @@ export interface Validation {
   comps: number;
   half_a: HeldOut;
   half_b: HeldOut;
+}
+
+// ------------------------------------------------------------------ the evidence
+
+/** The median of a set of numbers: the middle element once sorted, the house convention. */
+function medianOf(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)] ?? 0;
+}
+
+/** One staged fit's median pricing error on comps it was not fitted on, as a multiple. */
+function stageErrorX(fit: Fit, test: SnapshotProtocol[], asOf: string): number {
+  const errs = test.map((p) => Math.abs(fittedLogValue(fit, p, asOf).logValue - Math.log(p.mcap_usd as number)));
+  return round4(Math.exp(medianOf(errs)));
+}
+
+/**
+ * The walk-forward split: the model is fitted on the comps listed earlier and priced on the
+ * ones listed later, the way a radar is actually used - the past pricing the future. Comps
+ * with no recorded listing date train only: an undated protocol cannot be shown to come
+ * after anything.
+ */
+function walkForwardSplit(comps: SnapshotProtocol[]): { train: SnapshotProtocol[]; test: SnapshotProtocol[]; undated: number } {
+  const dated = comps
+    .filter((p) => p.listed_at !== null)
+    .sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : a.listed_at! > b.listed_at! ? 1 : a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const undated = comps.filter((p) => p.listed_at === null);
+  const cut = Math.floor(dated.length / 2);
+  return { train: [...undated, ...dated.slice(0, cut)], test: dated.slice(cut), undated: undated.length };
+}
+
+/** Every stage's leave-one-out errors: each comp priced by a fit, stopped at that stage, on all the others. */
+function looStageErrors(comps: SnapshotProtocol[], asOf: string): number[][] {
+  return comps.map((held, i) => {
+    const train = comps.filter((_, j) => j !== i);
+    const actual = Math.log(held.mcap_usd as number);
+    const errs: number[] = [];
+    for (let s = 0; s <= 4; s++) {
+      errs.push(Math.abs(fittedLogValue(fitStaged(train, asOf, s), held, asOf).logValue - actual));
+    }
+    return errs;
+  });
+}
+
+/**
+ * A candidate term the model does not carry, tested the way the carried terms are: a
+ * coefficient fitted on the full fit's residuals, then the walk-forward and leave-one-out
+ * errors of the model with the candidate added. Nothing here touches the board.
+ */
+function candidateErrors(
+  wfTrain: SnapshotProtocol[],
+  wfTest: SnapshotProtocol[],
+  comps: SnapshotProtocol[],
+  asOf: string,
+  valOf: (p: SnapshotProtocol) => number,
+): { wf: number | null; loo: number } {
+  const withCandidate = (train: SnapshotProtocol[], held: SnapshotProtocol): number => {
+    const full = fitModel(train, asOf);
+    const vals = train.map(valOf);
+    const mv = vals.reduce((s, v) => s + v, 0) / Math.max(1, vals.length);
+    let num = 0;
+    let den = 0;
+    train.forEach((p, i) => {
+      const resid = Math.log(p.mcap_usd as number) - fittedLogValue(full, p, asOf).logValue;
+      num += (vals[i]! - mv) * resid;
+      den += (vals[i]! - mv) * (vals[i]! - mv);
+    });
+    const coef = den > 0 ? num / den : 0;
+    return fittedLogValue(full, held, asOf).logValue + coef * (valOf(held) - mv) - Math.log(held.mcap_usd as number);
+  };
+  const wf =
+    wfTest.length > 0
+      ? round4(Math.exp(medianOf(wfTest.map((p) => Math.abs(withCandidate(wfTrain, p))))))
+      : null;
+  const loo = round4(Math.exp(medianOf(comps.map((held, i) => Math.abs(withCandidate(comps.filter((_, j) => j !== i), held))))));
+  return { wf, loo };
+}
+
+/** A range's factors from one fit's own residuals: the quantiles of its errors. */
+function rangeFactors(fit: Fit, comps: SnapshotProtocol[], asOf: string, loF: number, hiF: number): { lo: number; hi: number } {
+  const r = comps.map((p) => Math.log(p.mcap_usd as number) - fittedLogValue(fit, p, asOf).logValue).sort((a, b) => a - b);
+  const q = (f: number): number => r[Math.min(r.length - 1, Math.floor(f * r.length))] ?? 0;
+  return { lo: round4(Math.exp(q(loF))), hi: round4(Math.exp(q(hiF))) };
+}
+
+/** The share of a test set whose real cap lands inside the range a fit prints for it. */
+function rangeCoverage(fit: Fit, factors: { lo: number; hi: number }, test: SnapshotProtocol[], asOf: string): number {
+  if (test.length === 0) return 0;
+  let inside = 0;
+  for (const p of test) {
+    const pred = Math.exp(fittedLogValue(fit, p, asOf).logValue);
+    const actual = p.mcap_usd as number;
+    if (actual >= pred * factors.lo && actual <= pred * factors.hi) inside++;
+  }
+  return Math.round((1000 * inside) / test.length) / 10;
+}
+
+/** Why a carried term stays, from its two blind tests against the stage before it. */
+function termVerdict(prevWf: number | null, prevLoo: number, wf: number | null, loo: number): string {
+  const looHelps = loo < prevLoo - 0.005;
+  if (wf === null || prevWf === null) {
+    return looHelps ? 'kept - it lowers the leave-one-out error' : 'kept - leave-one-out does not reward it on this snapshot';
+  }
+  const wfHelps = wf < prevWf - 0.005;
+  if (wfHelps && looHelps) return 'kept - it lowers the error in both tests';
+  if (wfHelps) return 'kept - it lowers the walk-forward error; leave-one-out does not reward it';
+  if (looHelps) return 'kept - it lowers the leave-one-out error; walk-forward does not reward it';
+  return 'kept - neither blind test rewards it on this snapshot';
+}
+
+/** Why a candidate stays out, from its two blind tests against the full model. */
+function candidateVerdict(wf: number | null, loo: number, fullWf: number | null, fullLoo: number): string {
+  const wfWins = wf !== null && fullWf !== null && wf < fullWf - 0.005;
+  const looWins = loo < fullLoo - 0.005;
+  if (wfWins && looWins) return 'not kept - it wins both blind tests on this snapshot, and the model still does not carry it';
+  if (wfWins || looWins) return 'not kept - it wins one blind test, not both';
+  return 'not kept - the model prices better without it in both tests';
+}
+
+/**
+ * Why a placebo control stays out. A control carries no economics, so it must not help; the
+ * verdict states what it actually did, because a control that swept both tests would put
+ * the tests themselves in doubt, not earn a place in the model.
+ */
+function placeboVerdict(wf: number | null, loo: number, fullWf: number | null, fullLoo: number): string {
+  const wfWins = wf !== null && fullWf !== null && wf < fullWf - 0.005;
+  const looWins = loo < fullLoo - 0.005;
+  if (wfWins && looWins) return 'not kept - it wins both tests on this snapshot, which is what noise does now and then; a control is never promoted to a term';
+  if (wfWins || looWins) return 'not kept - it wins one blind test, not both; a control that won both would put the tests themselves in doubt';
+  return 'not kept - it does not help in either test, which is what a control is for';
+}
+
+/** A deterministic coin flip per protocol, from its slug's FNV-1a hash: the placebo feature. */
+function coinOf(p: SnapshotProtocol): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < p.slug.length; i++) {
+    h ^= p.slug.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return (h % 1000) / 1000 - 0.5;
+}
+
+/** A seeded generator (mulberry32): the bootstrap must land on the same figures every run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** The standard deviation of a set of round statistics: the bootstrap's standard error. */
+function sdOf(xs: number[]): number {
+  if (xs.length < 2) return 0;
+  const m = xs.reduce((s, x) => s + x, 0) / xs.length;
+  return Math.sqrt(xs.reduce((s, x) => s + (x - m) * (x - m), 0) / (xs.length - 1));
+}
+
+/** One row of the term table: a stage of the model, or a candidate it does not carry. */
+export interface TermRow {
+  term: string;
+  detail: string;
+  in_model: boolean;
+  walk_forward_x: number | null;
+  loo_x: number | null;
+  verdict: string;
+}
+
+/** The odds' blind record: Brier score of the pooled odds against the base rate alone. */
+export interface OddsEvidence {
+  brier_model: number;
+  brier_base: number;
+  tested: number;
+  base_rate_pct: number;
+}
+
+/** One printed range's honesty: what it claims to cover, and what the blind tests measure. */
+export interface RangeLevel {
+  stated_pct: number;
+  lo_mult: number;
+  hi_mult: number;
+  walk_forward_pct: number | null;
+  loo_pct: number;
+}
+
+/** The ranges' honesty at two widths: the printed inner range and the wider outer one. */
+export interface RangeEvidence {
+  inner: RangeLevel;
+  outer: RangeLevel;
+  within_3x_pct: number;
+}
+
+/**
+ * How sure the fitted figures are, from bootstrap refits: the model refitted on resamples
+ * of its own comps, its median fitted multiple and its out-of-bag error recorded each
+ * round, and the odds' blind calls resampled for the Brier score's standard error.
+ */
+export interface Uncertainty {
+  rounds: number;
+  multiple_median: number;
+  multiple_se: number;
+  oob_median_x: number;
+  oob_se_x: number;
+  brier_se: number;
+}
+
+/** Everything the evidence panel states, computed from the snapshot at run time. */
+export interface Evidence {
+  terms: TermRow[];
+  walk_forward: { trained_on: number; tested_on: number; undated_in_train: number };
+  loo_comps: number;
+  odds: OddsEvidence;
+  range: RangeEvidence;
+  uncertainty: Uncertainty;
+}
+
+/**
+ * The evidence for one snapshot: the term table under both blind tests, the candidates, the
+ * odds' Brier record and the range's measured coverage. Every figure comes from the model's
+ * own fitting code run on this snapshot's comps - the same code that priced the board.
+ */
+export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit: Fit): Evidence {
+  const asOf = snapshot.as_of;
+  const wf = walkForwardSplit(comps);
+  const wfX: (number | null)[] = [];
+  for (let s = 0; s <= 4; s++) {
+    wfX.push(wf.test.length > 0 ? stageErrorX(fitStaged(wf.train, asOf, s), wf.test, asOf) : null);
+  }
+  const loo = looStageErrors(comps, asOf);
+  const looX = [0, 1, 2, 3, 4].map((s) => round4(Math.exp(medianOf(loo.map((e) => e[s]!)))));
+
+  const termDefs = [
+    { stage: 1, term: 'Size - log TVL', detail: 'the fitted line of value against TVL, one Huber reweighting pass' },
+    { stage: 2, term: 'Family adjustment', detail: "each family's mean residual, shrunk toward zero by n/(n+6)" },
+    { stage: 3, term: '7-day TVL growth', detail: 'the snapshot growth figure, clamped to [-60, +120] per cent' },
+    { stage: 4, term: 'Age with no token', detail: 'log of one plus the years since listing' },
+  ];
+  const terms: TermRow[] = [
+    {
+      term: 'No terms - the flat median',
+      detail: 'every comp priced at the comps median cap; the line each term must beat',
+      in_model: false,
+      walk_forward_x: wfX[0] ?? null,
+      loo_x: looX[0] ?? null,
+      verdict: 'the baseline',
+    },
+    ...termDefs.map((d) => ({
+      term: d.term,
+      detail: d.detail,
+      in_model: true,
+      walk_forward_x: wfX[d.stage] ?? null,
+      loo_x: looX[d.stage] ?? null,
+      verdict: termVerdict(wfX[d.stage - 1] ?? null, looX[d.stage - 1]!, wfX[d.stage] ?? null, looX[d.stage]!),
+    })),
+  ];
+
+  const fullWf = wfX[4] ?? null;
+  const fullLoo = looX[4]!;
+  const candidates = [
+    { term: 'Chain count - log(1 + chains)', detail: 'how many chains the protocol runs on', valOf: (p: SnapshotProtocol) => Math.log(1 + p.chains.length) },
+    {
+      term: 'Size curvature - (log TVL) squared',
+      detail: 'a bend in the size line, for very large and very small TVL',
+      valOf: (p: SnapshotProtocol) => {
+        const x = Math.log(p.tvl_usd);
+        return x * x;
+      },
+    },
+  ];
+  for (const c of candidates) {
+    const e = candidateErrors(wf.train, wf.test, comps, asOf, c.valOf);
+    terms.push({
+      term: c.term,
+      detail: c.detail,
+      in_model: false,
+      walk_forward_x: e.wf,
+      loo_x: e.loo,
+      verdict: candidateVerdict(e.wf, e.loo, fullWf, fullLoo),
+    });
+  }
+
+  // Two placebo controls, run through the same machinery as the real candidates. Neither
+  // carries any economics - one is the length of a protocol's slug, the other a coin flip
+  // fixed per protocol by its slug's hash - so an honest table shows them failing to help;
+  // if one ever swept both tests, that would indict the tests, not promote the control.
+  const placebos = [
+    {
+      term: 'Placebo control - slug length',
+      detail: 'how long the protocol\u2019s slug is; it knows nothing about value and must not help',
+      valOf: (p: SnapshotProtocol) => Math.log(1 + p.slug.length),
+    },
+    {
+      term: 'Placebo control - a coin flip from the slug hash',
+      detail: 'one fixed random number per protocol, from its slug\u2019s hash; it must not help',
+      valOf: coinOf,
+    },
+  ];
+  for (const c of placebos) {
+    const e = candidateErrors(wf.train, wf.test, comps, asOf, c.valOf);
+    terms.push({
+      term: c.term,
+      detail: c.detail,
+      in_model: false,
+      walk_forward_x: e.wf,
+      loo_x: e.loo,
+      verdict: placeboVerdict(e.wf, e.loo, fullWf, fullLoo),
+    });
+  }
+
+  // The odds, blind: fit the peer record on one slug-hash half of the universe, score the
+  // other half's real outcomes with the Brier score, then swap. The base rate alone is the
+  // baseline the pooled odds must beat. The blind calls are kept for the bootstrap below.
+  const [halfA, halfB] = splitHalf(snapshot.protocols);
+  const brierPairs: { pr: number; y: number }[] = [];
+  const brierRun = (train: SnapshotProtocol[], test: SnapshotProtocol[]): { model: number; base: number; baseRate: number } => {
+    const om = fitOdds({ ...snapshot, protocols: train });
+    let se = 0;
+    let seb = 0;
+    for (const p of test) {
+      const y = isPreToken(p) ? 0 : 1;
+      const pr = launchOdds(om, p, asOf);
+      brierPairs.push({ pr, y });
+      se += (pr - y) * (pr - y);
+      seb += (om.base - y) * (om.base - y);
+    }
+    return { model: se / Math.max(1, test.length), base: seb / Math.max(1, test.length), baseRate: om.base };
+  };
+  const ab = brierRun(halfA, halfB);
+  const ba = brierRun(halfB, halfA);
+  const tested = halfA.length + halfB.length;
+  const odds: OddsEvidence = {
+    brier_model: round4((ab.model * halfB.length + ba.model * halfA.length) / Math.max(1, tested)),
+    brier_base: round4((ab.base * halfB.length + ba.base * halfA.length) / Math.max(1, tested)),
+    tested,
+    base_rate_pct: Math.round(((ab.baseRate + ba.baseRate) / 2) * 1000) / 10,
+  };
+
+  // The ranges at two widths: factors from the board fit's own residuals (the inner range
+  // is the one printed beside each implied value), coverage measured blind both ways.
+  const wfFit = fitModel(wf.train, asOf);
+  let looInInner = 0;
+  let looInOuter = 0;
+  comps.forEach((held, i) => {
+    const train = comps.filter((_, j) => j !== i);
+    const f = fitModel(train, asOf);
+    const pred = Math.exp(fittedLogValue(f, held, asOf).logValue);
+    const actual = held.mcap_usd as number;
+    const fi = rangeFactors(f, train, asOf, 0.25, 0.75);
+    if (actual >= pred * fi.lo && actual <= pred * fi.hi) looInInner++;
+    const fo = rangeFactors(f, train, asOf, 0.1, 0.9);
+    if (actual >= pred * fo.lo && actual <= pred * fo.hi) looInOuter++;
+  });
+  const rangeLevel = (loF: number, hiF: number, stated: number, looInside: number): RangeLevel => {
+    const fac = rangeFactors(fit, comps, asOf, loF, hiF);
+    return {
+      stated_pct: stated,
+      lo_mult: fac.lo,
+      hi_mult: fac.hi,
+      walk_forward_pct:
+        wf.test.length > 0 ? rangeCoverage(wfFit, rangeFactors(wfFit, wf.train, asOf, loF, hiF), wf.test, asOf) : null,
+      loo_pct: Math.round((1000 * looInside) / Math.max(1, comps.length)) / 10,
+    };
+  };
+  const within3 = loo.filter((e) => e[4]! <= Math.log(3)).length;
+  const range: RangeEvidence = {
+    inner: rangeLevel(0.25, 0.75, 50, looInInner),
+    outer: rangeLevel(0.1, 0.9, 80, looInOuter),
+    within_3x_pct: Math.round((1000 * within3) / Math.max(1, comps.length)) / 10,
+  };
+
+  // Uncertainty, from 200 seeded bootstrap rounds: refit the model on a resample of its
+  // comps, record the median fitted multiple over the comps and the median error on the
+  // comps the resample left out, and resample the odds' blind calls for the Brier score.
+  // Seeded, so the figures are the same on every run of the same snapshot.
+  const ROUNDS = 200;
+  const rng = mulberry32(0x9e3779b9);
+  const medianMultiple = (f: Fit): number =>
+    medianOf(comps.map((p) => Math.exp(fittedLogValue(f, p, asOf).logValue) / p.tvl_usd));
+  const bootMultiples: number[] = [];
+  const bootOob: number[] = [];
+  const bootBrier: number[] = [];
+  const n = comps.length;
+  for (let r = 0; r < ROUNDS; r++) {
+    const drawn: number[] = [];
+    const seen = new Set<number>();
+    for (let k = 0; k < n; k++) {
+      const i = Math.floor(rng() * n);
+      drawn.push(i);
+      seen.add(i);
+    }
+    const f = fitModel(drawn.map((i) => comps[i]!), asOf);
+    bootMultiples.push(medianMultiple(f));
+    const oob = comps.filter((_, i) => !seen.has(i));
+    if (oob.length >= 5) bootOob.push(stageErrorX(f, oob, asOf));
+    let se = 0;
+    for (let k = 0; k < brierPairs.length; k++) {
+      const pair = brierPairs[Math.floor(rng() * brierPairs.length)]!;
+      se += (pair.pr - pair.y) * (pair.pr - pair.y);
+    }
+    bootBrier.push(se / Math.max(1, brierPairs.length));
+  }
+  const uncertainty: Uncertainty = {
+    rounds: ROUNDS,
+    multiple_median: round4(medianMultiple(fit)),
+    multiple_se: round4(sdOf(bootMultiples)),
+    oob_median_x: round4(medianOf(bootOob)),
+    oob_se_x: round4(sdOf(bootOob)),
+    brier_se: round4(sdOf(bootBrier)),
+  };
+
+  return {
+    terms,
+    walk_forward: { trained_on: wf.train.length, tested_on: wf.test.length, undated_in_train: wf.undated },
+    loo_comps: comps.length,
+    odds,
+    range,
+    uncertainty,
+  };
+}
+
+/**
+ * Each stage's record under the split-half test the page has always shown: fit one slug-hash
+ * half, price the other, both ways. The board-change yardstick: a different model earns the
+ * board only by beating the full model here, in both directions.
+ */
+export function stagedSplitHalf(comps: SnapshotProtocol[], asOf: string): { stage: number; a_to_b_x: number; b_to_a_x: number }[] {
+  const [halfA, halfB] = splitHalf(comps);
+  const out: { stage: number; a_to_b_x: number; b_to_a_x: number }[] = [];
+  for (let s = 0; s <= 4; s++) {
+    const ab = stageErrorX(fitStaged(halfA, asOf, s), halfB, asOf);
+    const ba = stageErrorX(fitStaged(halfB, asOf, s), halfA, asOf);
+    out.push({ stage: s, a_to_b_x: ab, b_to_a_x: ba });
+  }
+  return out;
+}
+
+/** The board's checksum: FNV-1a over its rows' ranks, slugs and values, as an 8-digit hex. */
+export function boardChecksum(board: BoardRow[]): string {
+  let h = 0x811c9dc5;
+  const s = board.map((r) => `${r.rank}|${r.slug}|${r.implied_value_usd}|${r.expected_value_usd}`).join(';');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
 }
 
 // ------------------------------------------------------------------ launch odds
@@ -607,6 +1093,21 @@ export function stepText(step: FarmStep): string {
   return s;
 }
 
+/**
+ * The verdict as the board's table states it: a label on the same bands verdictFor phrases,
+ * the expected value net of the plan's gas, and the expected value per active hour of the
+ * plan (its setup and weekly actions; the holding days are the position's, not the farmer's
+ * working time). Capital is not subtracted: it stays in the position and comes back.
+ */
+export function verdictParts(expected: number, spec: PlanSpec): { label: string; net_usd: number; per_hour_usd: number } {
+  const hours = (60 + 10 * spec.weeks) / 60;
+  return {
+    label: expected >= 1_000_000 ? 'Farm first' : expected >= 100_000 ? 'Farm' : expected >= 10_000 ? 'Farm small' : 'Watch only',
+    net_usd: Math.round(expected - spec.total_cost_usd),
+    per_hour_usd: Math.round((expected / hours) * 100) / 100,
+  };
+}
+
 /** The farm verdict: expected value against the plan's own cost, in one line. */
 export function verdictFor(expected: number, spec: PlanSpec): string {
   const cost = `$${spec.total_cost_usd.toFixed(2)} of gas over the plan, ${money(spec.capital_usd)} of capital in the position`;
@@ -672,6 +1173,9 @@ export interface RadarRow {
   plan: PlanSpec;
   steps: FarmStep[];
   verdict: string;
+  verdict_label: string;
+  net_usd: number;
+  per_hour_usd: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value. */
@@ -687,16 +1191,24 @@ export interface LiveRow {
   multiple: number | null;
 }
 
-/** How every protocol in the snapshot is accounted for. */
+/** One line of the accounting: a group of protocols and why they stand where they stand. */
+export interface AccountingGroup {
+  label: string;
+  short: string;
+  count: number;
+}
+
+/**
+ * How every protocol in the snapshot is accounted for: the groups partition the snapshot -
+ * each protocol lands in exactly one - and the out-groups are named from the snapshot's own
+ * category field where a category is what sets them aside.
+ */
 export interface Accounting {
   total: number;
   ranked: number;
   watchlist: number;
   comps: number;
-  tokenized_unpriced: number;
-  excluded_products: number;
-  excluded_cex: number;
-  excluded_versioned: number;
+  groups: AccountingGroup[];
 }
 
 /** The fitted model's public face: its terms and its held-out record. */
@@ -718,6 +1230,8 @@ export interface RadarData {
   floor_usd: number;
   model: ModelInfo;
   accounting: Accounting;
+  evidence: Evidence;
+  integrity: { checksum: string; rows: number };
   rows: RadarRow[];
   live: LiveRow[];
 }
@@ -777,6 +1291,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
 
   const rows: RadarRow[] = board.map((r, i) => {
     const s = scored[i]!;
+    const vp = verdictParts(r.expected_value_usd, s.spec);
     return {
       rank: r.rank,
       slug: r.slug,
@@ -799,6 +1314,9 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       plan: s.spec,
       steps: s.steps,
       verdict: r.farm_verdict,
+      verdict_label: vp.label,
+      net_usd: vp.net_usd,
+      per_hour_usd: vp.per_hour_usd,
     };
   });
 
@@ -821,15 +1339,52 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
   const family_comps: Record<string, number> = {};
   for (const f of FAMILIES) family_comps[f] = comps.filter((p) => familyOf(p) === f).length;
 
+  // The accounting partition, in the same priority the rankability test applies: an
+  // exchange front-end first, then the snapshot's own product categories, then a product
+  // by name, then a versioned pool. Every pre-token protocol lands in exactly one group,
+  // on any snapshot, because the groups are the rankability test read line by line.
+  const preToken = snapshot.protocols.filter(isPreToken);
+  const inCats = (set: Set<string>) => (p: SnapshotProtocol): boolean => p.category !== null && set.has(p.category);
+  const accountingGroups: AccountingGroup[] = [
+    { label: 'pre-token, ranked on the board', short: 'ranked', count: board.length },
+    { label: 'already trade - the comps the model is fitted on', short: 'traded comps', count: comps.length },
+    {
+      label: 'already trade, but the snapshot carries no usable cap for them',
+      short: 'traded, no usable cap',
+      count: snapshot.protocols.filter((p) => !isPreToken(p)).length - comps.length,
+    },
+    {
+      label: "exchange front-ends - the snapshot's own CEX category",
+      short: 'CEX front-ends',
+      count: preToken.filter((p) => p.category === 'CEX').length,
+    },
+    {
+      label: "bridges - the snapshot's own Bridge and Canonical Bridge categories",
+      short: 'bridges',
+      count: preToken.filter((p) => p.category !== 'CEX' && inCats(BRIDGE_CATEGORIES)(p)).length,
+    },
+    {
+      label: "liquid restaking - the snapshot's own Liquid Restaking and Restaked BTC categories",
+      short: 'liquid restaking',
+      count: preToken.filter((p) => p.category !== 'CEX' && inCats(RESTAKING_CATEGORIES)(p)).length,
+    },
+    {
+      label: 'products of traded tokens by name - the name itself says wrapped, staked or bridged',
+      short: 'products by name',
+      count: preToken.filter((p) => p.category !== 'CEX' && !inCats(PRODUCT_CATEGORIES)(p) && isProduct(p)).length,
+    },
+    {
+      label: 'versioned pools - the name carries a version number',
+      short: 'versioned pools',
+      count: preToken.filter((p) => p.category !== 'CEX' && !isProduct(p) && VERSIONED.test(p.name)).length,
+    },
+  ];
   const accounting: Accounting = {
     total: snapshot.protocols.length,
     ranked: board.length,
     watchlist: snapshot.watchlist.length,
     comps: comps.length,
-    tokenized_unpriced: snapshot.protocols.filter((p) => !isPreToken(p)).length - comps.length,
-    excluded_products: snapshot.protocols.filter((p) => isPreToken(p) && p.category !== 'CEX' && isProduct(p)).length,
-    excluded_cex: snapshot.protocols.filter((p) => isPreToken(p) && p.category === 'CEX').length,
-    excluded_versioned: snapshot.protocols.filter((p) => isPreToken(p) && p.category !== 'CEX' && !isProduct(p) && VERSIONED.test(p.name)).length,
+    groups: accountingGroups.filter((g, i) => i < 3 || g.count > 0),
   };
 
   const radar: RadarData = {
@@ -847,6 +1402,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       validation,
     },
     accounting,
+    evidence: buildEvidence(snapshot, comps, fit),
+    integrity: { checksum: boardChecksum(board), rows: board.length },
     rows,
     live,
   };
