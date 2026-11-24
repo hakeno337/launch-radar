@@ -86,9 +86,15 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 const acc = radar.accounting;
+const ev = radar.evidence;
 process.stdout.write(
-  `token radar: ${acc.total} protocols accounted for: ${acc.ranked} pre-token ranked (${acc.watchlist} watchlist), ` +
-    `${acc.comps} traded comps the model is fitted on, ${acc.tokenized_unpriced} traded without a price in the snapshot, ` +
-    `${acc.excluded_products} wrapped, staked or bridged products of traded tokens, ${acc.excluded_cex + acc.excluded_versioned} exchanges and versioned pools set aside with reasons\n` +
+  `token radar: evidence: full model walk-forward x${ev.terms[4]!.walk_forward_x ?? '-'} and leave-one-out x${ev.terms[4]!.loo_x} median error; ` +
+    `odds Brier ${ev.odds.brier_model} against the base rate's ${ev.odds.brier_base} on ${ev.odds.tested} blind-scored protocols; ` +
+    `the printed range claims ${ev.range.inner.stated_pct}% and covers ${ev.range.inner.walk_forward_pct ?? '-'}% walk-forward, ${ev.range.inner.loo_pct}% leave-one-out; ` +
+    `the wider range claims ${ev.range.outer.stated_pct}% and covers ${ev.range.outer.walk_forward_pct ?? '-'}% walk-forward, ${ev.range.outer.loo_pct}% leave-one-out; ` +
+    `bootstrap (${ev.uncertainty.rounds} refits): median fitted multiple x${ev.uncertainty.multiple_median} +- ${ev.uncertainty.multiple_se}, out-of-bag error x${ev.uncertainty.oob_median_x} +- ${ev.uncertainty.oob_se_x}; board checksum ${radar.integrity.checksum}\n`,
+);
+process.stdout.write(
+  `token radar: ${acc.total} protocols accounted for (${acc.watchlist} watchlist): ${acc.groups.map((g) => `${g.count} ${g.label}`).join('; ')}\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')}, ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
