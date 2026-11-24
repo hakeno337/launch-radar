@@ -31,7 +31,7 @@ function strip() {
     `<b>${a.ranked}</b> pre-token ranked`,
     `<b class="good">${a.watchlist}/${a.watchlist}</b> watchlist covered`,
     `model fitted on <b>${v.comps}</b> traded comps`,
-    `held-out median error <b>x${v.half_a.median_error_x}</b> and <b>x${v.half_b.median_error_x}</b> (both directions)`,
+    `held-out median error <b>x${v.half_a.median_error_x.toFixed(2)}</b> and <b>x${v.half_b.median_error_x.toFixed(2)}</b> (both directions)`,
     `<b>${Math.round((v.half_a.within_2x_pct + v.half_b.within_2x_pct) / 2)}%</b> of held-out comps priced within x2`,
     `launch odds from the peer record (base rate <b>${R.model.odds_base_pct}%</b> hold a token)`,
   ];
@@ -82,18 +82,8 @@ function renderBoard() {
 
 // ---------------------------------------------------------------- the detail view
 
-// The plan's steps, phrased from the same spec the program priced into board.json.
-function planSteps(r) {
-  const s = r.plan;
-  return [
-    [`Start from a fresh wallet that holds only the funds for this farm, seed phrase written offline; never farm from a wallet that holds savings.`, 'nothing to open; about $3 of gas to fund it', '10 minutes'],
-    [`Move ${small(s.capital_usd)} of USDC onto ${s.chain} (bridge or exchange withdrawal), keeping ${small(s.gas_usd * 3)} aside for gas.`, `about ${small(s.gas_usd)} in gas`, '15 minutes'],
-    [s.action, `${small(s.capital_usd)} of capital in the position, about ${small(s.gas_usd)} in gas`, '20 minutes to set up'],
-    [`Repeat one qualifying action a week for ${s.weeks} weeks - a deposit top-up, a borrow repay, a swap or a vote - always from the same wallet.`, `about ${small(s.weekly_gas_usd)} of gas a week, ${small(s.weekly_gas_usd * s.weeks)} over the plan`, '10 minutes a week'],
-    [`Hold the position at least ${s.hold_days} days so the activity lands in more than one weekly snapshot; points programs count duration, not just volume.`, `the ${small(s.capital_usd)} stays locked in the position`, `${s.hold_days} days`],
-    [`Claim only from the link on ${r.name}'s own page, never from a search ad or a DM; then log the wallet, dates and transactions so the position can be repeated or unwound.`, 'no honest claim charges a fee; logging is free', '15 minutes'],
-  ];
-}
+// The plan's steps come from the program's own data (r.steps): the same steps, word for
+// word, that board.json carries for this protocol, so the page cannot drift from the board.
 
 function openDetail(slug) {
   const r = bySlug.get(slug);
@@ -118,7 +108,7 @@ function openDetail(slug) {
     </table>
     <div class="verdict"><b>Verdict:</b> ${esc(r.verdict)}</div>
     <h3>Farm plan - ${esc(r.plan.chain)}, ${small(r.plan.capital_usd)} position, ${r.plan.hold_days} days</h3>
-    <ol class="plan">${planSteps(r).map((s) => `<li>${esc(s[0])}<span class="ct">Cost: ${esc(s[1])}. Time: ${esc(s[2])}.</span></li>`).join('')}</ol>`;
+    <ol class="plan">${r.steps.map((s) => `<li>${esc(s.text)}<span class="ct">Cost: ${esc(s.cost)}. Time: ${esc(s.time)}.</span></li>`).join('')}</ol>`;
   $('close-detail').addEventListener('click', () => { d.hidden = true; state.sel = null; renderBoard(); });
   d.scrollIntoView({ behavior: 'smooth', block: 'start' });
   renderBoard();
@@ -152,8 +142,13 @@ function renderModel() {
     universe's ${m.odds_base_pct}% base rate and pooled. Expected value is implied value times those odds.
     Treat every implied value as the centre of a wide range - the held-out record below is the honest
     width of it. The ranking is what the model stands behind; the exact dollar figure is an estimate
-    with error bars of roughly x${v.half_a.median_error_x} either way.</p>`;
-  const hrow = (label, h) => `<tr><td>${label}</td><td class="num">${h.fitted_on}</td><td class="num">${h.tested_on}</td><td class="num">x${h.median_error_x}</td><td class="num">${h.within_2x_pct}%</td></tr>`;
+    with held-out median errors of x${v.half_a.median_error_x.toFixed(1)} and x${v.half_b.median_error_x.toFixed(1)} in the two directions.</p>
+    <p>Every row's farm plan is written by the program, not pasted: six steps priced from the protocol's
+    own chain, TVL band and age, and a seventh when its record calls for one - a seven-day TVL fall of
+    15% or more, a rise of 25% or more, no listing date recorded, a listing under 60 days old, or a
+    protocol spread over six or more chains. The step the record calls for sits fourth, right after
+    the position itself is opened, and the detail view shows it in place.</p>`;
+  const hrow = (label, h) => `<tr><td>${label}</td><td class="num">${h.fitted_on}</td><td class="num">${h.tested_on}</td><td class="num">x${h.median_error_x.toFixed(2)}</td><td class="num">${h.within_2x_pct}%</td></tr>`;
   $('valid-rows').innerHTML = hrow('Half A fits, half B is priced', v.half_a) + hrow('Half B fits, half A is priced', v.half_b);
   $('fam-rows').innerHTML = Object.keys(m.family_adj).map((f) => `
     <tr><td>${esc(f)}</td><td class="num">${m.family_comps[f]}</td><td class="num">${mult(Math.exp(m.family_adj[f]))}</td></tr>`).join('');
@@ -178,6 +173,11 @@ function init() {
   $('fam').innerHTML = fams.map((f) => `<option>${esc(f)}</option>`).join('');
   const chains = [...new Set(rows.flatMap((r) => r.chains))].sort();
   $('chain').innerHTML = ['All chains', ...chains].map((c) => `<option>${esc(c)}</option>`).join('');
+  const hf = location.hash.match(/^#\/f\/(.+)$/);
+  if (hf) {
+    const fam = decodeURIComponent(hf[1]);
+    if (fams.includes(fam)) { state.fam = fam; $('fam').value = fam; }
+  }
   $('q').addEventListener('input', (e) => { state.q = e.target.value.trim().toLowerCase(); renderBoard(); });
   $('fam').addEventListener('change', (e) => { state.fam = e.target.value; renderBoard(); });
   $('chain').addEventListener('change', (e) => { state.chain = e.target.value; renderBoard(); });
