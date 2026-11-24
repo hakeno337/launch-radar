@@ -514,9 +514,55 @@ export interface FarmStep {
 
 const money = (n: number): string => (n < 10 ? `$${n.toFixed(2)}` : `$${Math.round(n)}`);
 
-/** The full plan for one protocol: six steps, each an action with a cost and a time. */
-export function farmSteps(p: SnapshotProtocol, spec: PlanSpec): FarmStep[] {
-  return [
+/**
+ * The step a protocol's own record calls for, read off the snapshot's figures: a sharp
+ * seven-day fall or rise in TVL, no recorded listing date, a very young listing, or a
+ * protocol spread over many chains. One at most, the first that fires in that order, so
+ * two plans differ where the protocols themselves differ, not only in their numbers.
+ */
+function signalStep(p: SnapshotProtocol, spec: PlanSpec, age: number | null): FarmStep | null {
+  const change = typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null;
+  if (change !== null && change <= -15) {
+    return {
+      text: `Read the snapshot's warning first: ${p.name}'s TVL fell ${Math.abs(Math.round(change))}% in the seven days before the snapshot. Start at half size, and add the second half only after a week in which the protocol's own page shows TVL holding or recovering.`,
+      cost: `a first deposit of ${money(spec.capital_usd / 2)} of the ${money(spec.capital_usd)} planned; the rest stays in the wallet`,
+      time: 'one extra 5-minute check each week',
+    };
+  }
+  if (change !== null && change >= 25) {
+    return {
+      text: `The snapshot shows ${p.name}'s TVL up ${Math.round(change)}% in seven days: growth that fast usually means the crowd is already arriving, so keep the position at the plan's stated size and do not chase it larger - late size is what dilutes a fixed points pool.`,
+      cost: 'no extra cost; discipline only',
+      time: 'no extra time',
+    };
+  }
+  if (p.listed_at === null) {
+    return {
+      text: `DefiLlama records no listing date for ${p.name}, so its age is unknown rather than young: before sizing up, read the protocol's own docs for how long its contracts have held funds, and open with a test deposit of a tenth of the position.`,
+      cost: `a test deposit of ${money(Math.max(10, Math.round(spec.capital_usd / 10)))} first`,
+      time: '20 minutes of reading before the first deposit',
+    };
+  }
+  if (age !== null && age < 60) {
+    return {
+      text: `${p.name} was listed only ${age} days before the snapshot: the early window is where launch programs weight wallets most, and where contracts are least tested, so make the first deposit this week and keep it at the plan's size, no larger.`,
+      cost: `${money(spec.capital_usd)} as planned, nothing extra`,
+      time: 'start within 7 days',
+    };
+  }
+  if (p.chains.length >= 6) {
+    return {
+      text: `${p.name} runs on ${p.chains.length} chains in the snapshot; this plan farms it on ${spec.chain}, the chain the plan prices. Work one chain per wallet: the same funds split across chains usually count as several small wallets, not one committed one.`,
+      cost: 'no extra cost; one chain only',
+      time: 'no extra time',
+    };
+  }
+  return null;
+}
+
+/** The full plan for one protocol: six steps, and a seventh when its own record raises a signal. */
+export function farmSteps(p: SnapshotProtocol, spec: PlanSpec, age: number | null): FarmStep[] {
+  const steps: FarmStep[] = [
     {
       text: `Start from a fresh wallet that holds only the funds for this farm, seed phrase written offline; never farm from a wallet that holds savings.`,
       cost: 'nothing to open; about $3 of gas to fund it',
@@ -548,6 +594,9 @@ export function farmSteps(p: SnapshotProtocol, spec: PlanSpec): FarmStep[] {
       time: '15 minutes',
     },
   ];
+  const signal = signalStep(p, spec, age);
+  if (signal !== null) steps.splice(3, 0, signal);
+  return steps;
 }
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
@@ -621,6 +670,7 @@ export interface RadarRow {
   age_multiplier: number;
   watchlist: boolean;
   plan: PlanSpec;
+  steps: FarmStep[];
   verdict: string;
 }
 
@@ -691,7 +741,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     const implied = Math.max(1, Math.round(Math.exp(f.logValue)));
     const o = launchOdds(odds, p, snapshot.as_of);
     const spec = planSpec(p, f.age);
-    return { p, f, implied, odds: o, expected: Math.round(implied * o), spec };
+    return { p, f, implied, odds: o, expected: Math.round(implied * o), spec, steps: farmSteps(p, spec, f.age) };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
 
@@ -722,7 +772,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       age_days: s.f.age,
     },
     farm_verdict: verdictFor(s.expected, s.spec),
-    farm_steps: farmSteps(s.p, s.spec).map(stepText),
+    farm_steps: s.steps.map(stepText),
   }));
 
   const rows: RadarRow[] = board.map((r, i) => {
@@ -747,6 +797,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       age_multiplier: r.model.age_multiplier,
       watchlist: watch.has(r.slug),
       plan: s.spec,
+      steps: s.steps,
       verdict: r.farm_verdict,
     };
   });
