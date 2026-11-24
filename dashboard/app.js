@@ -5,7 +5,25 @@
 const R = window.RADAR;
 const rows = R.rows;
 const bySlug = new Map(rows.map((r) => [r.slug, r]));
-const state = { q: '', fam: 'All families', chain: 'All chains', wl: false, key: 'rank', dir: 1, sel: null };
+const state = { q: '', fam: 'All families', chain: 'All chains', verdict: 'All verdicts', wl: false, key: 'rank', dir: 1, sel: null };
+
+// The verdict scenario: position size as a multiple of each plan's stated position, the
+// share of the launch value the position is assumed to capture, and the horizon in weeks
+// (0 = each plan's own). At the defaults - x1, 100%, as planned - the recomputation below
+// returns the board's printed verdicts exactly; the protocol pages always show those.
+const scen = { size: 1, share: 100, horizon: 0 };
+
+function scenarioVerdict(r) {
+  const gross = r.expected_value_usd * (scen.share / 100) * scen.size;
+  const weeks = scen.horizon === 0 ? r.plan.weeks : scen.horizon;
+  const gas = r.plan.total_cost_usd + r.plan.weekly_gas_usd * (weeks - r.plan.weeks);
+  const hours = (60 + 10 * weeks) / 60;
+  return {
+    label: gross >= 1e6 ? 'Farm first' : gross >= 1e5 ? 'Farm' : gross >= 1e4 ? 'Farm small' : 'Watch only',
+    net: Math.round(gross - gas),
+    perHour: Math.round((gross / hours) * 100) / 100,
+  };
+}
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -20,6 +38,8 @@ const small = (n) => (n < 10 ? `$${n.toFixed(2)}` : `$${Math.round(n)}`);
 const pct = (n) => (n === null || n === undefined ? '-' : `${n > 0 ? '+' : ''}${Math.round(n * 10) / 10}%`);
 const age = (d) => (d === null || d === undefined ? 'unknown' : d >= 730 ? `${(d / 365.25).toFixed(1)}y` : d >= 60 ? `${Math.round(d / 30.4)}mo` : `${d}d`);
 const mult = (n) => `x${(Math.round(n * 100) / 100).toFixed(2)}`;
+const vclass = (label) => (label === 'Farm first' || label === 'Farm' ? 'farm' : label === 'Farm small' ? 'small' : 'watch');
+const x2 = (n) => (n === null || n === undefined ? '-' : `x${n.toFixed(2)}`);
 
 // ---------------------------------------------------------------- the strip
 
@@ -39,12 +59,81 @@ function strip() {
   $('asof').innerHTML = `Snapshot as of ${esc(R.as_of)}<br>Model <b>${esc(R.model.version)}</b> - watchlist floor ${money(R.floor_usd)}`;
 }
 
+// ---------------------------------------------------------------- accounting and integrity
+
+// The board's checksum, the same FNV-1a the program states: recomputed here from the rows
+// this page actually received, so the strip below is a check, not a copy.
+function boardChecksum(list) {
+  let h = 0x811c9dc5;
+  const s = list.map((r) => `${r.rank}|${r.slug}|${r.implied_value_usd}|${r.expected_value_usd}`).join(';');
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0');
+}
+
+function renderChecks() {
+  const a = R.accounting;
+  const groupSum = a.groups.reduce((s, g) => s + g.count, 0);
+  const ranksOk = rows.every((r, i) => r.rank === i + 1);
+  const orderOk = rows.every((r, i) => i === 0 || r.implied_value_usd <= rows[i - 1].implied_value_usd);
+  const wlOk = rows.filter((r) => r.watchlist).length === a.watchlist;
+  const sumOk = groupSum === a.total;
+  const csOk = boardChecksum(rows) === R.integrity.checksum;
+  const mark = (ok) => (ok ? '<b class="good">holds</b>' : '<b class="bad">FAILS</b>');
+  const chips = [
+    `<b>${a.total}</b> protocols, each in exactly one group: ${a.groups.map((g) => `<b>${g.count}</b> ${esc(g.short)}`).join(' - ')}`,
+    `recomputed by this page from the rows it received: the groups sum to the snapshot total - ${mark(sumOk)} - ranks run 1 to ${rows.length} in order - ${mark(ranksOk)} - implied values never rise - ${mark(orderOk)} - all <b>${a.watchlist}</b> watchlist protocols are ranked - ${mark(wlOk)}`,
+    `board checksum <b>${R.integrity.checksum}</b>, recomputed by this page from the rows it received - ${mark(csOk)}`,
+  ];
+  $('checks').innerHTML = chips.map((c) => `<span class="chip">${c}</span>`).join('');
+}
+
+// ---------------------------------------------------------------- the evidence panel
+
+function renderEvidence() {
+  const e = R.evidence;
+  const w = e.walk_forward;
+  $('evidence-text').innerHTML = `
+    <p>Nothing on this page is asserted. The program that wrote this board also put it through two blind
+    tests on this snapshot's <b>${e.loo_comps} traded comps</b>, with its own fitting code. <b>Walk-forward:</b>
+    fit on the ${w.trained_on} comps listed earlier (${w.undated_in_train} record no listing date and train
+    only), then price the ${w.tested_on} listed later. <b>Leave-one-out:</b> price each comp with a fit on the
+    other ${e.loo_comps - 1}. Errors are medians, stated as multiples. A third test, the slug-hash split in
+    both directions, is in the model panel below.</p>`;
+  $('term-rows').innerHTML = e.terms.map((t) => `
+    <tr><td><span class="pname">${esc(t.term)}</span>${t.verdict.startsWith('not kept') ? '<span class="cat"> - not in the model</span>' : ''} <span class="cat">- ${esc(t.detail)}</span></td>
+    <td class="num">${x2(t.walk_forward_x)}</td><td class="num">${x2(t.loo_x)}</td><td>${esc(t.verdict)}</td></tr>`).join('');
+  const o = e.odds;
+  $('odds-text').innerHTML = `
+    <p>The launch odds were scored the same way: the peer record fitted on one half of the snapshot's
+    ${o.tested} protocols, blind, then used to call the other half - and swapped. Their Brier score (mean
+    squared miss of the called probability; lower is better) is <b>${o.brier_model.toFixed(3)}</b>, against
+    <b>${o.brier_base.toFixed(3)}</b> for calling the ${o.base_rate_pct}% base rate for everyone. The pooled
+    record beats the base rate blind; it remains a record of peers, not a forecast.</p>`;
+  const u = e.uncertainty;
+  $('uncertainty-text').innerHTML = `
+    <p>Uncertainty, from <b>${u.rounds} bootstrap refits</b> - the model refitted on resamples of its own
+    comps, the spread of each statistic across the rounds stated as its standard error: the median fitted
+    multiple is <b>x${u.multiple_median.toFixed(2)}</b> with a standard error of <b>${u.multiple_se.toFixed(2)}</b>;
+    the out-of-bag median error is <b>x${u.oob_median_x.toFixed(2)}</b> with a standard error of
+    <b>${u.oob_se_x.toFixed(2)}</b>; the Brier score above carries a standard error of <b>${u.brier_se.toFixed(3)}</b>.
+    The multiples are wide because the comps themselves are wide; the page states the spread rather than
+    hiding it.</p>`;
+  const g = e.range;
+  const levelRow = (lvl, name) => `
+    <tr><td>${name} (x${lvl.lo_mult.toFixed(2)} to x${lvl.hi_mult.toFixed(2)})</td>
+    <td class="num">${lvl.stated_pct}%</td><td class="num">${lvl.walk_forward_pct === null ? '-' : `${lvl.walk_forward_pct}%`}</td><td class="num">${lvl.loo_pct}%</td></tr>`;
+  $('range-rows').innerHTML =
+    levelRow(g.inner, `The range printed beside each implied value - the middle half of the model's own errors; ${g.within_3x_pct}% of blind-priced comps land within x3 of their real cap (leave-one-out)`) +
+    levelRow(g.outer, `The wider range - the middle four fifths of the model's own errors, printed here for its record, not beside the values`);
+}
+
 // ---------------------------------------------------------------- the board
 
 function visible() {
   let out = rows.filter((r) =>
     (state.fam === 'All families' || r.family === state.fam) &&
     (state.chain === 'All chains' || r.chains.includes(state.chain)) &&
+    (state.verdict === 'All verdicts' || scenarioVerdict(r).label === state.verdict) &&
     (!state.wl || r.watchlist) &&
     (state.q === '' || r.name.toLowerCase().includes(state.q) || r.slug.includes(state.q)));
   if (state.key !== 'rank') {
@@ -62,7 +151,11 @@ function visible() {
 function renderBoard() {
   const out = visible();
   $('count').textContent = `${out.length} of ${rows.length} ranked protocols`;
-  $('rows').innerHTML = out.map((r) => `
+  const worth = rows.filter((r) => scenarioVerdict(r).label !== 'Watch only').length;
+  $('sc-head').innerHTML = `Worth farming in this scenario: <b>${worth} of ${rows.length}</b>`;
+  $('rows').innerHTML = out.map((r) => {
+    const sv = scenarioVerdict(r);
+    return `
     <tr data-slug="${esc(r.slug)}" class="${state.sel === r.slug ? 'sel' : ''}">
       <td class="num">${r.rank}</td>
       <td><span class="pname">${esc(r.name)}</span>${r.watchlist ? '<span class="wl">WATCHLIST</span>' : ''}<br><span class="cat">${esc(r.category ?? 'Uncategorised')}</span></td>
@@ -71,10 +164,12 @@ function renderBoard() {
       <td class="num">${money(r.tvl_usd)}</td>
       <td class="num ${r.change_7d === null ? '' : r.change_7d >= 0 ? 'up' : 'down'}">${pct(r.change_7d)}</td>
       <td class="num">${age(r.age_days)}</td>
-      <td class="num imp">${money(r.implied_value_usd)}</td>
+      <td class="num imp">${money(r.implied_value_usd)}<span class="rng">${money(r.implied_value_usd * R.evidence.range.inner.lo_mult)}-${money(r.implied_value_usd * R.evidence.range.inner.hi_mult)}</span></td>
       <td class="num">${Math.round(r.launch_odds * 100)}%</td>
       <td class="num">${money(r.expected_value_usd)}</td>
-    </tr>`).join('');
+      <td class="num"><span class="vlab ${vclass(sv.label)}">${esc(sv.label)}</span><span class="rng">net ${money(sv.net)} - ${small(sv.perHour)}/h</span></td>
+    </tr>`;
+  }).join('');
   for (const tr of document.querySelectorAll('#rows tr')) {
     tr.addEventListener('click', () => openDetail(tr.dataset.slug));
   }
@@ -104,9 +199,10 @@ function openDetail(slug) {
       <tr><td><b>Implied launch value</b></td><td class="num imp">${money(r.implied_value_usd)}</td></tr>
       <tr><td>Launch odds - the peer record for its family, age band and size band</td><td class="num">${Math.round(r.launch_odds * 100)}%</td></tr>
       <tr><td><b>Expected value</b> (implied x odds)</td><td class="num">${money(r.expected_value_usd)}</td></tr>
+      <tr><td>Printed range - the middle half of the model's own errors</td><td class="num">${money(r.implied_value_usd * R.evidence.range.inner.lo_mult)}-${money(r.implied_value_usd * R.evidence.range.inner.hi_mult)}</td></tr>
       <tr><td>Plan cost, all-in gas</td><td class="num">${small(r.plan.total_cost_usd)}</td></tr>
     </table>
-    <div class="verdict"><b>Verdict:</b> ${esc(r.verdict)}</div>
+    <div class="verdict"><b>Verdict: ${esc(r.verdict_label)}.</b> ${esc(r.verdict)}<br>Net of the plan's gas, the expected value is <b>${money(r.net_usd)}</b> - <b>${small(r.per_hour_usd)}</b> per active hour of the plan.</div>
     <h3>Farm plan - ${esc(r.plan.chain)}, ${small(r.plan.capital_usd)} position, ${r.plan.hold_days} days</h3>
     <ol class="plan">${r.steps.map((s) => `<li>${esc(s.text)}<span class="ct">Cost: ${esc(s.cost)}. Time: ${esc(s.time)}.</span></li>`).join('')}</ol>`;
   $('close-detail').addEventListener('click', () => { d.hidden = true; state.sel = null; renderBoard(); });
@@ -140,8 +236,9 @@ function renderModel() {
     <p>Launch odds are the snapshot's own cross-section, not a forecast: for a protocol's family, its age
     band and its TVL band, the share of protocols that already record a token, each smoothed toward the
     universe's ${m.odds_base_pct}% base rate and pooled. Expected value is implied value times those odds.
-    Treat every implied value as the centre of a wide range - the held-out record below is the honest
-    width of it. The ranking is what the model stands behind; the exact dollar figure is an estimate
+    Treat every implied value as the centre of the printed range beside it - the middle half of the
+    model's own errors - whose measured coverage the evidence panel above the board states. The
+    ranking is what the model stands behind; the exact dollar figure is an estimate
     with held-out median errors of x${v.half_a.median_error_x.toFixed(1)} and x${v.half_b.median_error_x.toFixed(1)} in the two directions.</p>
     <p>Every row's farm plan is written by the program, not pasted: six steps priced from the protocol's
     own chain, TVL band and age, and a seventh when its record calls for one - a seven-day TVL fall of
@@ -155,13 +252,8 @@ function renderModel() {
   const arow = (label, n) => `<tr><td>${label}</td><td class="num">${n}</td></tr>`;
   $('acct-rows').innerHTML =
     arow('Protocols in the snapshot', a.total) +
-    arow('Ranked on this board (pre-token, launch candidates)', a.ranked) +
-    arow(' - of which on the house watchlist', a.watchlist) +
-    arow('Already trading, with a price - the comps the model is fitted on', a.comps) +
-    arow('Already trading, no price recorded in the snapshot', a.tokenized_unpriced) +
-    arow('Set aside: wrapped, staked or bridged products of tokens that already trade', a.excluded_products) +
-    arow('Set aside: exchange front-ends', a.excluded_cex) +
-    arow('Set aside: versioned pools of another protocol', a.excluded_versioned);
+    a.groups.map((g) => arow(esc(g.label[0].toUpperCase() + g.label.slice(1)), g.count)).join('') +
+    arow(' - of the ranked, on the house watchlist', a.watchlist);
   $('foot').textContent = `Data: the sealed DefiLlama snapshot of ${R.as_of}, read once by the program; nothing on this page is fetched. Model ${m.version}. Farm plans are planning estimates - gas figures are per-chain planning numbers, and a protocol's own page is the authority on its program.`;
 }
 
@@ -169,10 +261,28 @@ function renderModel() {
 
 function init() {
   strip();
+  renderChecks();
+  renderEvidence();
   const fams = ['All families', ...new Set(rows.map((r) => r.family))];
   $('fam').innerHTML = fams.map((f) => `<option>${esc(f)}</option>`).join('');
   const chains = [...new Set(rows.flatMap((r) => r.chains))].sort();
   $('chain').innerHTML = ['All chains', ...chains].map((c) => `<option>${esc(c)}</option>`).join('');
+  $('vfilter').innerHTML = ['All verdicts', 'Farm first', 'Farm', 'Farm small', 'Watch only'].map((v) => `<option>${esc(v)}</option>`).join('');
+  $('vfilter').addEventListener('change', (e) => { state.verdict = e.target.value; renderBoard(); });
+  const scenSync = () => {
+    $('sc-size-v').textContent = `x${scen.size.toFixed(2)}`;
+    $('sc-share-v').textContent = `${scen.share}%`;
+    $('sc-horizon-v').textContent = scen.horizon === 0 ? 'as planned' : `${scen.horizon} weeks`;
+  };
+  $('sc-size').addEventListener('input', (e) => { scen.size = Number(e.target.value); scenSync(); renderBoard(); });
+  $('sc-share').addEventListener('input', (e) => { scen.share = Number(e.target.value); scenSync(); renderBoard(); });
+  $('sc-horizon').addEventListener('input', (e) => { scen.horizon = Number(e.target.value); scenSync(); renderBoard(); });
+  $('sc-reset').addEventListener('click', () => {
+    scen.size = 1; scen.share = 100; scen.horizon = 0;
+    $('sc-size').value = '1'; $('sc-share').value = '100'; $('sc-horizon').value = '0';
+    scenSync(); renderBoard();
+  });
+  scenSync();
   const hf = location.hash.match(/^#\/f\/(.+)$/);
   if (hf) {
     const fam = decodeURIComponent(hf[1]);
