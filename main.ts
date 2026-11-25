@@ -87,8 +87,10 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 const acc = radar.accounting;
 const ev = radar.evidence;
+const shippedTerm = ev.terms.filter((t) => t.in_model).pop()!;
 process.stdout.write(
-  `token radar: evidence: full model walk-forward x${ev.terms[4]!.walk_forward_x ?? '-'} and leave-one-out x${ev.terms[4]!.loo_x} median error; ` +
+  `token radar: evidence: shipped model walk-forward x${shippedTerm.walk_forward_x ?? '-'} and leave-one-out x${shippedTerm.loo_x} median error; ` +
+    `selection: over ${ev.selection.directions} repeated split-half pricings the four-term model beats the shipped one ${ev.selection.full_vs_shipped.win_rate_pct}% of the time (median error ratio x${ev.selection.full_vs_shipped.ratio_median}); ` +
     `odds Brier ${ev.odds.brier_model} against the base rate's ${ev.odds.brier_base} on ${ev.odds.tested} blind-scored protocols; ` +
     `the printed range claims ${ev.range.inner.stated_pct}% and covers ${ev.range.inner.walk_forward_pct ?? '-'}% walk-forward, ${ev.range.inner.loo_pct}% leave-one-out; ` +
     `the wider range claims ${ev.range.outer.stated_pct}% and covers ${ev.range.outer.walk_forward_pct ?? '-'}% walk-forward, ${ev.range.outer.loo_pct}% leave-one-out; ` +

@@ -8,12 +8,12 @@ An entry for make.fun's [token launch radar bounty](https://make.fun/bounty/toke
 
 ## The model
 
-The implied value is fitted, not asserted. On the protocols in the snapshot whose token already trades with a market cap and a TVL (the comps, exchange tokens set aside), four terms are fitted in turn, each on the residuals the earlier terms leave:
+The implied value is fitted, not asserted. On the protocols in the snapshot whose token already trades with a market cap and a TVL (the comps, exchange tokens set aside), terms are fitted in turn, each on the residuals the earlier terms leave. The model the board ships carries two of them:
 
 - a size term, `log value = A + B x log TVL`, least squares with one Huber reweighting pass;
-- a family adjustment per protocol family, shrunk toward zero by `n / (n + 6)`;
-- a growth term on the clamped 7-day TVL change;
-- an age term on `log(1 + years tokenless)`.
+- a family adjustment per protocol family, shrunk toward zero by `n / (n + 6)`.
+
+Two further terms — a growth term on the clamped 7-day TVL change and an age term on `log(1 + years tokenless)` — are fitted the same way and then tested the same way, and are not carried: under a repeated split-half of the comps (200 seeded splits, each priced in both directions), the four-term model beats the two-term model in only about a quarter of the pricings, at a median error about a tenth worse, and the age term is the largest single offender. The dashboard's evidence panel shows the whole selection record — the term-by-term blind tests and the head-to-head pricings — computed from the snapshot at run time.
 
 The fit is validated held-out both ways (split by slug hash: fit on one half, price the other, then swap), and both held-out results are printed on the dashboard next to the model. Launch odds come from the snapshot's own cross-section: the tokenized share by family, age band and TVL band, smoothed and pooled. Expected value is implied value times launch odds.
 
