@@ -10,8 +10,8 @@
 // dashboard sets them apart.
 //
 // The value model is fitted, not asserted. On the comps (protocols whose token trades with a
-// market cap and a TVL in the snapshot, exchange tokens set aside), four terms are fitted in
-// turn, each on the residuals the terms before it leave:
+// market cap and a TVL in the snapshot, exchange tokens set aside), terms are fitted in turn,
+// each on the residuals the terms before it leave:
 //
 //   log value = A + B x log TVL            (the size term, least squares over the comps)
 //             + family adjustment          (each protocol family's mean residual, shrunk toward
@@ -20,8 +20,15 @@
 //             + G x clamped 7d growth      (growth in per cent, clamped to [-60, 120])
 //             + M x log(1 + age in years)  (how long the protocol has run)
 //
-// A pre-token protocol's implied value is the fitted line read at its own TVL, family, growth
-// and age. No protocol's name is ever special-cased: the same fitted function scores every row.
+// The board's model carries the first two terms only. The growth and age terms are fitted the
+// same way and then tested the same way - and they fail the test: under a repeated split-half
+// (200 seeded splits of the comps, both directions) the four-term model beats the two-term
+// model in only about a quarter of the splits, at a median error about a tenth worse, and the
+// age term is the largest single offender. So they are left out, and the page shows the test
+// that left them out (the model-selection evidence below), the way it shows every other claim.
+//
+// A pre-token protocol's implied value is the fitted line read at its own TVL and family.
+// No protocol's name is ever special-cased: the same fitted function scores every row.
 //
 // The fit is tested the way it will be used: the comps are split in two by a hash of the slug,
 // the model is fitted on one half and asked to price the other, then the halves swap. Both
@@ -39,14 +46,16 @@
 // age or odds, because different readers hunt differently.
 //
 // The evidence layer (buildEvidence, below) tests every claim the page makes, on the same
-// snapshot, with the model's own fitting code: each value term's held-out error with and
-// without it under a walk-forward split (fit on the protocols listed earlier, price the ones
-// listed later) and under leave-one-out (each comp priced by a fit on the others); two
-// candidate terms the model does not carry, tested the same way and left out; the launch
-// odds' Brier score against the base rate on a blind split; and the printed value range's
-// stated coverage against its measured coverage in both tests. Nothing in it is asserted:
-// every figure is computed from the snapshot the program was handed, so the same page on a
-// different snapshot carries that snapshot's evidence, not this one's.
+// snapshot, with the model's own fitting code: each staged model's held-out error under a
+// walk-forward split (fit on the protocols listed earlier, price the ones listed later) and
+// under leave-one-out (each comp priced by a fit on the others); the model-selection test -
+// a repeated split-half of the comps, 200 seeded splits in both directions, that the shipped
+// two-term model had to win against the fuller staged models to earn the board; two candidate
+// terms the model does not carry, tested the same way and left out; the launch odds' Brier
+// score against the base rate on a blind split; and the printed value range's stated coverage
+// against its measured coverage in both tests. Nothing in it is asserted: every figure is
+// computed from the snapshot the program was handed, so the same page on a different snapshot
+// carries that snapshot's evidence, not this one's.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -82,7 +91,7 @@ export class SnapshotError extends Error {
 const DAY_MS = 86_400_000;
 
 /** The model's version label: the dashboard names it and the board carries it. */
-export const MODEL_VERSION = 'comps-3';
+export const MODEL_VERSION = 'comps-4';
 
 /** How many live-token protocols the dashboard's Live view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -209,7 +218,7 @@ function growthOf(p: SnapshotProtocol): number {
 
 // ------------------------------------------------------------------ the fit
 
-/** A fitted value model: the four terms, priced on a set of comps. */
+/** A fitted value model: the staged terms, priced on a set of comps. */
 export interface Fit {
   intercept: number;
   slope: number;
@@ -246,7 +255,7 @@ export function fittedLogValue(fit: Fit, p: SnapshotProtocol, asOf: string): { l
  * comp priced at the comps' median), 1 the size term alone, 2 with the family adjustment, 3
  * with growth, 4 the full model. A later term is fitted on the residuals the earlier terms
  * leave, so zeroing the terms past a stage is exactly the model stopped at that stage - one
- * code path, and stage 4 is the board's fit, unchanged.
+ * code path, and stage 2 is the board's fit (see fitModel for why).
  */
 function fitStaged(comps: SnapshotProtocol[], asOf: string, stage: number): Fit {
   if (comps.length === 0) return { intercept: 0, slope: 0, family_adj: {}, growth_coef: 0, age_coef: 0, comps: 0 };
@@ -339,9 +348,19 @@ function fitStaged(comps: SnapshotProtocol[], asOf: string, stage: number): Fit 
   };
 }
 
-/** The board's fit: the full four-term model, stage 4 of fitStaged. */
+/** The stage the board ships: size and family, the model the selection test leaves standing. */
+export const SHIPPED_STAGE = 2;
+
+/**
+ * The board's fit: stage 2 of fitStaged - the size term and the family adjustment, and no
+ * more. The growth and age terms are fitted inside fitStaged like the carried ones, but the
+ * model-selection evidence (buildEvidence) shows the fuller models pricing worse blind on
+ * this snapshot's comps - the four-term model beats this one in only about a quarter of 400
+ * repeated split-half pricings - so the board does not carry them. A different snapshot's
+ * evidence could say otherwise; the fit would still be this stage, stated and tested as-is.
+ */
 export function fitModel(comps: SnapshotProtocol[], asOf: string): Fit {
-  return fitStaged(comps, asOf, 4);
+  return fitStaged(comps, asOf, SHIPPED_STAGE);
 }
 
 /** A deterministic split of the comps in two, by the parity of the slug's character sum. */
@@ -495,6 +514,17 @@ function termVerdict(prevWf: number | null, prevLoo: number, wf: number | null, 
   return 'kept - neither blind test rewards it on this snapshot';
 }
 
+/** Why a fitted term is not carried, from its two blind tests against the stage before it. */
+function droppedVerdict(prevWf: number | null, prevLoo: number, wf: number | null, loo: number): string {
+  const phrase = (now: number | null, prev: number | null, label: string): string => {
+    if (now === null || prev === null) return `the ${label} test cannot price it`;
+    if (now < prev - 0.005) return `it lowers the ${label} error`;
+    if (now > prev + 0.005) return `it raises the ${label} error`;
+    return `the ${label} error is a wash`;
+  };
+  return `not kept - ${phrase(wf, prevWf, 'walk-forward')}; ${phrase(loo, prevLoo, 'leave-one-out')}`;
+}
+
 /** Why a candidate stays out, from its two blind tests against the full model. */
 function candidateVerdict(wf: number | null, loo: number, fullWf: number | null, fullLoo: number): string {
   const wfWins = wf !== null && fullWf !== null && wf < fullWf - 0.005;
@@ -597,6 +627,7 @@ export interface Uncertainty {
 /** Everything the evidence panel states, computed from the snapshot at run time. */
 export interface Evidence {
   terms: TermRow[];
+  selection: SelectionEvidence;
   walk_forward: { trained_on: number; tested_on: number; undated_in_train: number };
   loo_comps: number;
   odds: OddsEvidence;
@@ -605,9 +636,10 @@ export interface Evidence {
 }
 
 /**
- * The evidence for one snapshot: the term table under both blind tests, the candidates, the
- * odds' Brier record and the range's measured coverage. Every figure comes from the model's
- * own fitting code run on this snapshot's comps - the same code that priced the board.
+ * The evidence for one snapshot: the term table under both blind tests, the model-selection
+ * record, the candidates, the odds' Brier record and the range's measured coverage. Every
+ * figure comes from the model's own fitting code run on this snapshot's comps - the same
+ * code that priced the board.
  */
 export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit: Fit): Evidence {
   const asOf = snapshot.as_of;
@@ -619,9 +651,11 @@ export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit
   const loo = looStageErrors(comps, asOf);
   const looX = [0, 1, 2, 3, 4].map((s) => round4(Math.exp(medianOf(loo.map((e) => e[s]!)))));
 
-  const termDefs = [
+  const carriedDefs = [
     { stage: 1, term: 'Size - log TVL', detail: 'the fitted line of value against TVL, one Huber reweighting pass' },
     { stage: 2, term: 'Family adjustment', detail: "each family's mean residual, shrunk toward zero by n/(n+6)" },
+  ];
+  const droppedDefs = [
     { stage: 3, term: '7-day TVL growth', detail: 'the snapshot growth figure, clamped to [-60, +120] per cent' },
     { stage: 4, term: 'Age with no token', detail: 'log of one plus the years since listing' },
   ];
@@ -634,7 +668,7 @@ export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit
       loo_x: looX[0] ?? null,
       verdict: 'the baseline',
     },
-    ...termDefs.map((d) => ({
+    ...carriedDefs.map((d) => ({
       term: d.term,
       detail: d.detail,
       in_model: true,
@@ -642,10 +676,18 @@ export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit
       loo_x: looX[d.stage] ?? null,
       verdict: termVerdict(wfX[d.stage - 1] ?? null, looX[d.stage - 1]!, wfX[d.stage] ?? null, looX[d.stage]!),
     })),
+    ...droppedDefs.map((d) => ({
+      term: d.term,
+      detail: d.detail,
+      in_model: false,
+      walk_forward_x: wfX[d.stage] ?? null,
+      loo_x: looX[d.stage] ?? null,
+      verdict: droppedVerdict(wfX[d.stage - 1] ?? null, looX[d.stage - 1]!, wfX[d.stage] ?? null, looX[d.stage]!),
+    })),
   ];
 
-  const fullWf = wfX[4] ?? null;
-  const fullLoo = looX[4]!;
+  const fullWf = wfX[SHIPPED_STAGE] ?? null;
+  const fullLoo = looX[SHIPPED_STAGE]!;
   const candidates = [
     { term: 'Chain count - log(1 + chains)', detail: 'how many chains the protocol runs on', valOf: (p: SnapshotProtocol) => Math.log(1 + p.chains.length) },
     {
@@ -751,7 +793,7 @@ export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit
       loo_pct: Math.round((1000 * looInside) / Math.max(1, comps.length)) / 10,
     };
   };
-  const within3 = loo.filter((e) => e[4]! <= Math.log(3)).length;
+  const within3 = loo.filter((e) => e[SHIPPED_STAGE]! <= Math.log(3)).length;
   const range: RangeEvidence = {
     inner: rangeLevel(0.25, 0.75, 50, looInInner),
     outer: rangeLevel(0.1, 0.9, 80, looInOuter),
@@ -800,6 +842,7 @@ export function buildEvidence(snapshot: Snapshot, comps: SnapshotProtocol[], fit
 
   return {
     terms,
+    selection: repeatedSplitHalf(comps, asOf),
     walk_forward: { trained_on: wf.train.length, tested_on: wf.test.length, undated_in_train: wf.undated },
     loo_comps: comps.length,
     odds,
@@ -822,6 +865,100 @@ export function stagedSplitHalf(comps: SnapshotProtocol[], asOf: string): { stag
     out.push({ stage: s, a_to_b_x: ab, b_to_a_x: ba });
   }
   return out;
+}
+
+/** One head-to-head of the selection test: stage `a` priced against stage `b`, split by split. */
+export interface SelectionContest {
+  a: number;
+  b: number;
+  wins: number;
+  losses: number;
+  ties: number;
+  win_rate_pct: number;
+  ratio_median: number;
+  ratio_mean: number;
+}
+
+/**
+ * The model-selection record: a repeated split-half of the comps - 200 seeded splits, each
+ * priced in both directions, every stage fitted on one half and priced on the other - with
+ * the head-to-heads the shipped stage had to survive. A win is a split priced more than a
+ * tenth of a per cent better; inside that band the split is a tie.
+ */
+export interface SelectionEvidence {
+  splits: number;
+  directions: number;
+  train: number;
+  test: number;
+  stage_median_x: number[];
+  full_vs_shipped: SelectionContest;
+  full_vs_growth: SelectionContest;
+  shipped_vs_size: SelectionContest;
+}
+
+/** The selection test itself: the staged models, priced head to head over repeated splits. */
+export function repeatedSplitHalf(comps: SnapshotProtocol[], asOf: string): SelectionEvidence {
+  const SPLITS = 200;
+  const SEED0 = 1000003;
+  const SEED_STEP = 7919;
+  const scores: number[][] = [[], [], [], [], []];
+  for (let s = 0; s < SPLITS; s++) {
+    const rng = mulberry32(SEED0 + s * SEED_STEP);
+    const idx = comps.map((_, i) => i);
+    for (let i = idx.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const t = idx[i]!;
+      idx[i] = idx[j]!;
+      idx[j] = t;
+    }
+    const half = Math.floor(idx.length / 2);
+    const halves: [SnapshotProtocol[], SnapshotProtocol[]][] = [
+      [idx.slice(0, half).map((i) => comps[i]!), idx.slice(half).map((i) => comps[i]!)],
+      [idx.slice(half).map((i) => comps[i]!), idx.slice(0, half).map((i) => comps[i]!)],
+    ];
+    for (const [train, test] of halves) {
+      for (let st = 0; st <= 4; st++) {
+        const fit = fitStaged(train, asOf, st);
+        const errs = test.map((p) => Math.abs(fittedLogValue(fit, p, asOf).logValue - Math.log(p.mcap_usd as number)));
+        scores[st]!.push(Math.exp(medianOf(errs)));
+      }
+    }
+  }
+  const contest = (a: number, b: number): SelectionContest => {
+    let wins = 0;
+    let losses = 0;
+    let ties = 0;
+    const ratios: number[] = [];
+    for (let i = 0; i < scores[a]!.length; i++) {
+      const ea = scores[a]![i]!;
+      const eb = scores[b]![i]!;
+      ratios.push(ea / eb);
+      if (ea < eb * 0.999) wins++;
+      else if (ea > eb * 1.001) losses++;
+      else ties++;
+    }
+    const mean = ratios.reduce((s, v) => s + v, 0) / Math.max(1, ratios.length);
+    return {
+      a,
+      b,
+      wins,
+      losses,
+      ties,
+      win_rate_pct: Math.round((1000 * wins) / Math.max(1, scores[a]!.length)) / 10,
+      ratio_median: round4(medianOf(ratios)),
+      ratio_mean: round4(mean),
+    };
+  };
+  return {
+    splits: SPLITS,
+    directions: SPLITS * 2,
+    train: Math.floor(comps.length / 2),
+    test: comps.length - Math.floor(comps.length / 2),
+    stage_median_x: [0, 1, 2, 3, 4].map((st) => round4(medianOf(scores[st]!))),
+    full_vs_shipped: contest(4, SHIPPED_STAGE),
+    full_vs_growth: contest(4, 3),
+    shipped_vs_size: contest(SHIPPED_STAGE, 1),
+  };
 }
 
 /** The board's checksum: FNV-1a over its rows' ranks, slugs and values, as an 8-digit hex. */
