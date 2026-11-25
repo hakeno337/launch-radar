@@ -65,6 +65,9 @@ h1 { margin: 0; font-size: 26px; letter-spacing: .2px; }
 #terms th:nth-child(1) { width: 37%; }
 #terms th:nth-child(2), #terms th:nth-child(3) { width: 11%; }
 #terms th:nth-child(4) { width: 41%; }
+#selection { table-layout: fixed; }
+#selection th:nth-child(1) { width: 52%; }
+#selection th:nth-child(2), #selection th:nth-child(3), #selection th:nth-child(4) { width: 16%; }
 .controls {
   display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
   padding: 14px 28px 10px; position: sticky; top: 0; background: var(--bg); z-index: 3;

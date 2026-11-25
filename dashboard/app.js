@@ -97,11 +97,38 @@ function renderEvidence() {
     tests on this snapshot's <b>${e.loo_comps} traded comps</b>, with its own fitting code. <b>Walk-forward:</b>
     fit on the ${w.trained_on} comps listed earlier (${w.undated_in_train} record no listing date and train
     only), then price the ${w.tested_on} listed later. <b>Leave-one-out:</b> price each comp with a fit on the
-    other ${e.loo_comps - 1}. Errors are medians, stated as multiples. A third test, the slug-hash split in
-    both directions, is in the model panel below.</p>`;
+    other ${e.loo_comps - 1}. Errors are medians, stated as multiples. Below the terms, a third test -
+    a repeated split-half - decides which staged model the board ships; a fourth, the slug-hash split
+    in both directions, is in the model panel below.</p>`;
   $('term-rows').innerHTML = e.terms.map((t) => `
     <tr><td><span class="pname">${esc(t.term)}</span>${t.verdict.startsWith('not kept') ? '<span class="cat"> - not in the model</span>' : ''} <span class="cat">- ${esc(t.detail)}</span></td>
     <td class="num">${x2(t.walk_forward_x)}</td><td class="num">${x2(t.loo_x)}</td><td>${esc(t.verdict)}</td></tr>`).join('');
+  const s = e.selection;
+  const stageName = ['no terms', 'size', 'size + family', 'size + family + growth', 'all four terms'];
+  const med = s.stage_median_x.map((x, i) => `${stageName[i]} <b>x${x.toFixed(2)}</b>`).join(', ');
+  $('selection-text').innerHTML = `
+    <p>Why the model stops at two terms. The staged fits were also priced head to head over
+    <b>${s.splits} seeded random splits</b> of the comps - fitted on ${s.train}, priced on ${s.test},
+    then swapped: <b>${s.directions} pricings</b> per stage, computed by this program from this
+    snapshot. Median error by stage: ${med}. The fuller models lose. The four-term model beats the
+    shipped two-term model in only <b>${s.full_vs_shipped.win_rate_pct}%</b> of the pricings, and where
+    both price the same split its median error runs <b>x${s.full_vs_shipped.ratio_median.toFixed(2)}</b>
+    the shipped model's. The age term is the largest single offender: the four-term model beats the
+    three-term model in only <b>${s.full_vs_growth.win_rate_pct}%</b> of pricings, so the step from
+    three terms to four is where most of the damage arrives. Growth itself is a wash in the table
+    above - walk-forward cannot tell it from nothing, and leave-one-out prices worse with it. The
+    shipped model against size alone is a tie here (it wins <b>${s.shipped_vs_size.win_rate_pct}%</b>);
+    family stays because walk-forward - the test shaped like the board's use, the past pricing the
+    future - is where the two-term model posts the best error of any stage
+    (x${e.terms[2].walk_forward_x.toFixed(2)}). A term the tests do not reward is not carried,
+    however reasonable it sounds.</p>`;
+  const srow = (label, c, note) => `
+    <tr><td><span class="pname">${label}</span> <span class="cat">- ${note}</span></td>
+    <td class="num">${c.wins} of ${s.directions}</td><td class="num">${c.win_rate_pct}%</td><td class="num">x${c.ratio_median.toFixed(2)}</td></tr>`;
+  $('selection-rows').innerHTML =
+    srow('Four terms vs the shipped two', s.full_vs_shipped, 'the fuller model prices worse blind; the board does not ship it') +
+    srow('Four terms vs three - the age step', s.full_vs_growth, 'age alone accounts for most of the fuller model\u2019s damage') +
+    srow('The shipped two vs size alone', s.shipped_vs_size, 'a tie here; the walk-forward column above is what keeps family');
   const o = e.odds;
   $('odds-text').innerHTML = `
     <p>The launch odds were scored the same way: the peer record fitted on one half of the snapshot's
@@ -194,8 +221,8 @@ function openDetail(slug) {
     <table>
       <tr><td>Size term - the fitted line read at its TVL of ${money(r.tvl_usd)}</td><td class="num">${money(r.base_value_usd)}</td></tr>
       <tr><td>Family adjustment (${esc(r.family)})</td><td class="num">${mult(r.family_multiplier)}</td></tr>
-      <tr><td>Growth adjustment (7d TVL ${pct(r.change_7d)})</td><td class="num">${mult(r.growth_multiplier)}</td></tr>
-      <tr><td>Age adjustment (${age(r.age_days)} with no token)</td><td class="num">${mult(r.age_multiplier)}</td></tr>
+      <tr><td>Growth adjustment (7d TVL ${pct(r.change_7d)})${R.model.growth_coef === 0 ? ' - not a term of the shipped model: fitted, tested blind and not kept (see model selection above)' : ''}</td><td class="num">${mult(r.growth_multiplier)}</td></tr>
+      <tr><td>Age adjustment (${age(r.age_days)} with no token)${R.model.age_coef === 0 ? ' - not a term of the shipped model: fitted, tested blind and not kept (see model selection above)' : ''}</td><td class="num">${mult(r.age_multiplier)}</td></tr>
       <tr><td><b>Implied launch value</b></td><td class="num imp">${money(r.implied_value_usd)}</td></tr>
       <tr><td>Launch odds - the peer record for its family, age band and size band</td><td class="num">${Math.round(r.launch_odds * 100)}%</td></tr>
       <tr><td><b>Expected value</b> (implied x odds)</td><td class="num">${money(r.expected_value_usd)}</td></tr>
@@ -224,15 +251,21 @@ function renderModel() {
   const m = R.model;
   const v = m.validation;
   const a = R.accounting;
+  const sel = R.evidence.selection;
   $('model-text').innerHTML = `
     <p>The implied value of every row comes from one function, fitted on the <b>${v.comps} protocols in
     this snapshot whose token already trades</b> with a market cap and a TVL (exchange tokens set aside).
-    In log space: <code>value = A + B x log TVL + family + G x 7d growth + M x log(1 + age)</code>, with
-    B = ${m.slope}, G = ${m.growth_coef} per growth point, M = ${m.age_coef}. The size term is fitted by
-    least squares with one Huber reweighting pass, because the comps' value-to-TVL ratios run from under
-    0.01x to over 100x and the extremes should not drag the line; each later term is fitted on the
-    residuals the terms before it leave, and each family's adjustment is shrunk toward zero by
+    In log space: <code>value = A + B x log TVL + family</code>, with B = ${m.slope}. The size term is
+    fitted by least squares with one Huber reweighting pass, because the comps' value-to-TVL ratios run
+    from under 0.01x to over 100x and the extremes should not drag the line; the family adjustment is
+    fitted on the residuals the size term leaves, each family's mean residual shrunk toward zero by
     n/(n+6) so a family with two comps barely moves it. No protocol's name is special-cased anywhere.</p>
+    <p>Two further terms were fitted on the residuals in the same way - a growth term on the clamped
+    7-day TVL change and an age term on log(1 + years tokenless) - and the model does not carry them:
+    priced blind over ${sel.directions} repeated split-half pricings, the four-term model beats this
+    one only ${sel.full_vs_shipped.win_rate_pct}% of the time. The term table and the model-selection
+    record in the evidence panel above show the tests that decided it; each protocol's detail view
+    still shows the two adjustments, at x1.00, because a term that is not carried moves nothing.</p>
     <p>Launch odds are the snapshot's own cross-section, not a forecast: for a protocol's family, its age
     band and its TVL band, the share of protocols that already record a token, each smoothed toward the
     universe's ${m.odds_base_pct}% base rate and pooled. Expected value is implied value times those odds.
